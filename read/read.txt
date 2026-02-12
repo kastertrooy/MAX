@@ -1,0 +1,921 @@
+**Логика:**
+1. Инициализация логирования (JSON формат)
+2. Загрузка состояния из SQLite (восстановление очереди)
+3. Параллельный запуск:
+   - `telegram.start_bot()` — Webhook/polling
+   - `email_monitor.check_loop()` — IMAP цикл
+   - `main_processing_loop()` — основной цикл обработки
+4. Обработка сигналов остановки (SIGINT, SIGTERM)
+5. Graceful shutdown с сохранением состояния
+
+---
+
+### 1.2 `orchestrator.main_processing_loop()`
+**Задача:** Бесконечный цикл обработки задач из очереди
+
+**Логика:**
+```
+WHILE is_running:
+    IF is_paused:
+        sleep(5)
+        CONTINUE
+    
+    IF NOT check_rate_limits():
+        sleep(60)
+        CONTINUE
+    
+    issue_id = queue.get()
+    
+    IF issue_id is None:
+        scan_for_new_issues()  # Поиск новых bounty
+        sleep(30)
+        CONTINUE
+    
+    process_issue(issue_id)
+```
+
+---
+
+### 1.3 `orchestrator.process_issue(issue_id)`
+**Задача:** Обработка одного issue через State Machine
+
+**Логика:**
+1. Создание экземпляра `StateMachine`
+2. Запуск `state_machine.run()`
+3. Обработка исключений (логирование, уведомление TG)
+4. Очистка ресурсов после завершения
+
+---
+
+### 1.4 `orchestrator.scan_for_new_issues()`
+**Задача:** Поиск новых issue с bounty во всех доступных репозиториях
+
+**Логика:**
+1. Получение списка репозиториев через GitHub API
+2. Для каждого репо:
+   - GraphQL запрос: открытые issue с метками `[bounty, reward, $, paid, RTC]`
+   - Для каждого issue: AI анализ текста на наличие суммы (`$500`, `USD 100`)
+   - Если bounty обнаружен: создание записи в БД (status=PENDING)
+   - Добавление в PriorityQueue
+3. **Нет уведомления** — тихое добавление в очередь
+
+---
+
+### 1.5 `orchestrator.check_rate_limits()`
+**Задача:** Проверка лимитов всех API перед началом работы
+
+**Логика:**
+1. GitHub API: `get_rate_limit()` → если < 100, `notify_rate_limit()` → return False
+2. OpenAI API: `get_rate_limit()` → если критический, `notify_critical()` → `stop()` → return False
+3. Docker: `ping()` → если не отвечает, `ensure_running()` → если не удалось, return False
+4. Return True (все системы готовы)
+
+---
+
+### 1.6 `orchestrator.cmd_pause()`
+**Задача:** Приостановка обработки
+
+**Логика:**
+1. Установка флага `is_paused = True`
+2. Отмена текущей задачи (если есть) через `task.cancel()`
+3. Сохранение состояния текущей задачи в БД
+4. Уведомление в Telegram: "Программа приостановлена"
+
+---
+
+### 1.7 `orchestrator.cmd_resume()`
+**Задача:** Возобновление обработки
+
+**Логика:**
+1. Установка флага `is_paused = False`
+2. Проверка `check_rate_limits()`
+3. Возобновление `main_processing_loop()`
+4. Уведомление в Telegram: "Программа возобновлена"
+
+---
+
+### 1.8 `orchestrator.cmd_status()`
+**Задача:** Получение текущего статуса системы
+
+**Логика:**
+1. Запрос статистики из БД:
+   - PENDING: `count(status='pending')`
+   - ACTIVE: `count(status in [fetching, analyzing, coding, testing])`
+   - COMPLETED: `count(status='completed')`
+   - FAILED: `count(status='failed')`
+2. Получение rate limits от всех сервисов
+3. Форматирование красивого сообщения для Telegram
+4. Return строка с Markdown форматированием
+
+---
+
+### 1.9 `orchestrator.cmd_settings(**kwargs)`
+**Задача:** Изменение настроек на лету
+
+**Логика:**
+1. Параметры:
+   - `model`: "gpt-4" или "claude-3" → `ai_provider.set_model()`
+   - `max_time`: int → `docker_sandbox.timeout = value`
+   - `docker_cpu`: int → `docker_sandbox.cpu_tier = value`
+2. Валидация значений
+3. Сохранение в `.env` или БД
+4. Return подтверждение изменений
+
+---
+
+## 2. STATE MACHINE (Конечный автомат)
+
+### 2.1 `state_machine.run()`
+**Задача:** Главный цикл состояний для одного issue
+
+**Логика:**
+```
+WHILE current_state != COMPLETED:
+    SWITCH current_state:
+        CASE IDLE: transition_to(FETCHING)
+        CASE FETCHING: do_fetching()
+        CASE ANALYZING: do_analyzing()
+        CASE CODING: do_coding()
+        CASE TESTING: do_testing()
+        CASE CREATING_PR: do_creating_pr()
+        CASE FAILED: do_failed(); BREAK
+    
+    IF state_changed:
+        save_checkpoint()
+```
+
+---
+
+### 2.2 `state_machine.transition_to(new_state)`
+**Задача:** Безопасный переход между состояниями
+
+**Логика:**
+1. Логирование: `logger.info(f"{old} → {new}")`
+2. Обновление `current_state = new_state`
+3. Обновление `issue.status` в БД (маппинг enum)
+4. Обновление `issue.updated_at = now()`
+5. Commit в SQLite
+
+---
+
+### 2.3 `state_machine.do_fetching()`
+**Задача:** Сбор всех необходимых данных для issue
+
+**Логика:**
+1. `docker.ensure_running()` — проверка/запуск Docker
+2. `github.get_issue(repo, number)` — базовые данные issue
+3. `github.get_linked_issues(repo, number, depth=2)` — связанные A+B
+4. `github.get_linked_prs(repo, number)` — связанные PR с кодом
+5. `content_api.download_files(file_paths)` — скачивание файлов <100MB
+6. **Проверка размера:** если файл >100MB → `add_to_blacklist("file_too_large")` → `transition_to(FAILED)`
+7. Сохранение в `checkpoint_data['files']`, `checkpoint_data['linked']`
+8. `transition_to(ANALYZING)`
+
+**Исключения:**
+- `GitHubAPIError` → `retry_or_fail("fetching", error)`
+- `FileTooLarge` → `add_to_blacklist()` → `transition_to(FAILED)`
+
+---
+
+### 2.4 `state_machine.do_analyzing()`
+**Задача:** AI анализ контекста и планирование решения
+
+**Логика:**
+1. Формирование промпта:
+   - Issue title + body
+   - Linked issues (A+B) — их описания
+   - Linked PR — код изменений
+   - Текущий код файлов
+2. `ai.generate(prompt, model=current_model)` — получение analysis
+3. Парсинг ответа AI:
+   - `analysis['problem']` — описание проблемы
+   - `analysis['solution_plan']` — шаги решения
+   - `analysis['files_to_modify']` — список файлов
+   - `analysis['estimated_complexity']` — сложность (1-10)
+4. Сохранение в `checkpoint_data['analysis']`
+5. `transition_to(CODING)`
+
+**Исключения:**
+- `AIError` → `retry_or_fail("analyzing", error)`
+
+---
+
+### 2.5 `state_machine.do_coding()`
+**Задача:** Генерация кода решения
+
+**Логика:**
+1. Формирование промпта для генерации:
+   - Solution plan из предыдущего шага
+   - Текущий код файлов
+   - Требования: "Generate complete, working code"
+2. `code_generator.generate_solution(analysis, files)` — вызов AI
+3. Парсинг ответа:
+   - `generated_code[file_path] = content`
+   - `commit_message = generated['message']`
+4. **Security scan:** `security_scan(generated_code)`
+   - Проверка паттернов: `rm -rf`, `System.exit`, `os.system`, etc.
+   - Если CRITICAL найден → `add_to_blacklist("security_violation")` → `transition_to(FAILED)`
+5. Сохранение в `checkpoint_data['generated_code']`, `checkpoint_data['commit_message']`
+6. `transition_to(TESTING)`
+
+---
+
+### 2.6 `state_machine.do_testing()`
+**Задача:** Проверка кода в изолированном Docker
+
+**Логика:**
+1. Расчёт ресурсов:
+   - `code_size = sum(len(c) for c in generated_code.values())`
+   - `cpu_tier = 2 if code_size < 1000 else (4 if code_size < 5000 else 6)`
+   - `memory = 512 + sum(len(c.encode()) for c in generated_code.values()) / 10240` (MB)
+2. `docker.run_test(...)`:
+   - Создание временной директории
+   - Запись файлов
+   - Запуск контейнера с `network=none`, `read_only=True`
+   - Таймаут 25 секунд
+   - Ожидание результата
+3. Анализ результата:
+   - `exit_code == 0` → `transition_to(CREATING_PR)`
+   - `exit_code != 0` или timeout → `retry_or_fail("testing", error)`
+4. Сохранение логов теста в `checkpoint_data`
+
+---
+
+### 2.7 `state_machine.do_creating_pr()`
+**Задача:** Создание Pull Request на GitHub
+
+**Логика:**
+1. Генерация имени ветки: `ai/{issue_number}/{timestamp}`
+2. `github.create_branch(repo, base_branch, new_branch)` — создание ветки
+3. `github.create_commit(...)`:
+   - Загрузка изменённых файлов
+   - Коммит с сообщением от AI
+4. `github.create_pull_request(...)`:
+   - Title: "AI Fix: {issue_title}"
+   - Body: сгенерированное описание + ссылки
+   - Head: новая ветка, Base: main
+5. `github.comment_on_issue(...)` — комментарий с ссылкой на PR
+6. Создание записи в `pull_requests` таблице
+7. **Уведомление в Telegram:** `notify_pr_created()`
+8. `transition_to(COMPLETED)`
+
+**Исключения:**
+- `GitHubAPIError` → `retry_or_fail("creating_pr", error)`
+
+---
+
+### 2.8 `state_machine.retry_or_fail(stage, error)`
+**Задача:** Решение: повторить или признать неудачу
+
+**Логика:**
+1. `attempt_count += 1`
+2. Создание записи в `attempts`:
+   - `attempt_number = attempt_count`
+   - `status = error_type`
+   - `error_message = str(error)`
+   - `error_traceback = traceback`
+3. **IF** `attempt_count >= 3`:
+   - `add_to_blacklist(f"Failed after 3 attempts at {stage}")`
+   - `transition_to(FAILED)`
+4. **ELSE**:
+   - Логирование: `logger.info(f"Retry {attempt_count}/3")`
+   - `transition_to(CODING)` — возврат к генерации с контекстом ошибки
+   - В промпт добавляется: "Previous attempt failed with: {error}. Fix this issue."
+
+---
+
+### 2.9 `state_machine.add_to_blacklist(reason)`
+**Задача:** Перманентная блокировка issue
+
+**Логика:**
+1. `issue.is_blacklisted = True`
+2. `issue.blacklist_reason = reason`
+3. Создание записи в `blacklist` таблице:
+   - `issue_id`, `reason`, `added_by="auto"`, `is_permanent=True`
+4. `issue.status = BLACKLISTED`
+5. Commit в БД
+6. Логирование: `logger.warning(f"Blacklisted issue {issue_id}: {reason}")`
+
+---
+
+### 2.10 `state_machine.save_checkpoint()`
+**Задача:** Сохранение промежуточного состояния
+
+**Логика:**
+1. Сериализация `checkpoint_data` в JSON
+2. Обновление `issue.checkpoint_data = json`
+3. Commit в БД
+4. При восстановлении: десериализация и продолжение с последнего шага
+
+---
+
+## 3. GITHUB MODULE (Интеграция с GitHub)
+
+### 3.1 `github_client.get_rate_limit()`
+**Задача:** Получение оставшихся лимитов API
+
+**Логика:**
+1. REST API: `GET /rate_limit`
+2. Парсинг `resources.core.remaining`, `resources.core.reset`
+3. Сохранение в `rate_limit_logs`
+4. Return `remaining` (int)
+
+---
+
+### 3.2 `github_client.get_issue(repo, number)`
+**Задача:** Получение данных issue
+
+**Логика:**
+1. REST API: `GET /repos/{repo}/issues/{number}`
+2. Парсинг JSON: title, body, state, labels, created_at, etc.
+3. Return dict
+
+---
+
+### 3.3 `github_client.search_issues(repo, labels, state='open')`
+**Задача:** Поиск issue по меткам
+
+**Логика:**
+1. GraphQL запрос:
+   ```graphql
+   query {
+     repository(owner, name) {
+       issues(labels: [...], states: OPEN, first: 100) {
+         nodes { id, number, title, body, labels { name } }
+       }
+     }
+   }
+   ```
+2. Парсинг ответа
+3. Return list of issues
+
+---
+
+### 3.4 `github_client.get_linked_issues(repo, number, depth=2)`
+**Задача:** Получение связанных issue (глубина A+B)
+
+**Логика:**
+1. GraphQL: получить `closingIssuesReferences` для PR, связанных с issue
+2. Для каждого linked issue (depth 1):
+   - Получить его `closingIssuesReferences` (depth 2)
+3. Объединение всех unique issue IDs
+4. Return `{'issues': [...], 'pull_requests': [...]}`
+
+---
+
+### 3.5 `github_client.get_linked_prs(repo, number)`
+**Задача:** Получение PR, связанных с issue, и их код
+
+**Логика:**
+1. GraphQL: `timelineItems(itemTypes: [CROSS_REFERENCED_EVENT])`
+2. Фильтрация: только PR (не issue)
+3. Для каждого PR: получить `files` (changed files)
+4. Для каждого файла: получить `diff` или полный код через Content API
+5. Return `{'pr_number': {'files': {'path': 'diff'}}}`
+
+---
+
+### 3.6 `content_api.download_files(file_paths, max_size=100MB)`
+**Задача:** Скачивание файлов через Content API
+
+**Логика:**
+1. Для каждого `file_path`:
+   - `GET /repos/{repo}/contents/{path}`
+   - Получение `download_url` или `content` (base64)
+   - Декодирование base64
+   - **Проверка размера:** `len(content) > 100MB` → raise `FileTooLarge`
+2. Return `{'path': 'content'}`
+
+---
+
+### 3.7 `pr_manager.create_branch(repo, base, new_branch)`
+**Задача:** Создание новой ветки
+
+**Логика:**
+1. Получение SHA последнего коммита base ветки: `GET /repos/{repo}/git/refs/heads/{base}`
+2. Создание новой ветки: `POST /repos/{repo}/git/refs`
+   - `ref: refs/heads/{new_branch}`
+   - `sha: base_sha`
+3. Return branch name
+
+---
+
+### 3.8 `pr_manager.create_commit(repo, branch, files, message)`
+**Задача:** Создание коммита с изменениями
+
+**Логика:**
+1. Получение текущего дерева: `GET /repos/{repo}/git/refs/heads/{branch}`
+2. Создание blob для каждого файла: `POST /repos/{repo}/git/blobs`
+3. Создание нового дерева: `POST /repos/{repo}/git/trees`
+4. Создание коммита: `POST /repos/{repo}/git/commits`
+5. Обновление ref ветки: `PATCH /repos/{repo}/git/refs/heads/{branch}`
+6. Return commit SHA
+
+---
+
+### 3.9 `pr_manager.create_pull_request(repo, title, body, head, base)`
+**Задача:** Создание Pull Request
+
+**Логика:**
+1. REST API: `POST /repos/{repo}/pulls`
+   - `title`, `body`, `head`, `base`
+2. Парсинг ответа: получение `number`, `html_url`
+3. Return PR data dict
+
+---
+
+### 3.10 `comment_manager.comment_on_issue(repo, number, body)`
+**Задача:** Комментирование issue
+
+**Логика:**
+1. REST API: `POST /repos/{repo}/issues/{number}/comments`
+2. Return comment ID
+
+---
+
+## 4. AI MODULE (Искусственный интеллект)
+
+### 4.1 `ai_provider.set_model(model_name)`
+**Задача:** Переключение модели AI
+
+**Логика:**
+1. Валидация: `model_name in ['gpt-4', 'claude-3']`
+2. `current_model = model_name`
+3. Обновление API client (OpenAI или Anthropic)
+4. Логирование переключения
+
+---
+
+### 4.2 `ai_provider.get_rate_limit()`
+**Задача:** Получение лимитов текущего провайдера
+
+**Логика:**
+1. Для OpenAI: `GET /v1/dashboard/billing/subscription` или header `x-ratelimit-remaining`
+2. Для Claude: анализ headers от последнего запроса
+3. Return `{'remaining': int, 'reset_at': datetime}`
+
+---
+
+### 4.3 `ai_provider.generate(prompt, max_tokens, temperature=0.2)`
+**Задача:** Генерация текста через AI
+
+**Логика:**
+1. Форматирование запроса для текущей модели
+2. API call с retry (3 попытки при rate limit)
+3. Подсчёт токенов: input + output
+4. Сохранение в `analytics` (статистика использования)
+5. Return generated text
+
+---
+
+### 4.4 `ai_provider.detect_bounty(text)`
+**Задача:** AI анализ текста на наличие вознаграждения
+
+**Логика:**
+1. Промпт: "Analyze this GitHub issue text. Does it mention bounty/reward/payment? Extract amount in USD."
+2. AI анализирует паттерны: `$500`, `100 USD`, `reward: $50`, etc.
+3. Return `(has_bounty: bool, amount: float or None)`
+
+---
+
+### 4.5 `prompt_engineer.build_analysis_prompt(issue, linked_issues, linked_prs, files)`
+**Задача:** Создание промпта для анализа issue
+
+**Логика:**
+1. Структурирование данных:
+   - Issue: title, body
+   - Linked: список связанных issue с описаниями
+   - PRs: код изменений из связанных PR
+   - Files: текущий код
+2. Добавление инструкций: "Analyze the problem, understand context from linked issues, propose solution plan"
+3. Return formatted string
+
+---
+
+### 4.6 `prompt_engineer.build_code_prompt(analysis, files)`
+**Задача:** Создание промпта для генерации кода
+
+**Логика:**
+1. Включение `analysis['solution_plan']`
+2. Включение текущего кода `files`
+3. Инструкции: "Generate complete, working code. Include all necessary changes. Do not use os.system, Runtime.exec, or similar dangerous functions."
+4. Return formatted string
+
+---
+
+### 4.7 `code_generator.generate_solution(analysis, files)`
+**Задача:** Генерация решения через AI
+
+**Логика:**
+1. `prompt = prompt_engineer.build_code_prompt(analysis, files)`
+2. `response = ai_provider.generate(prompt, max_tokens=4000)`
+3. Парсинг ответа:
+   - Разделение на файлы (если AI вернул markdown blocks)
+   - Извлечение commit message
+4. Return `{'code': {'path': 'content'}, 'commit_message': 'str'}`
+
+---
+
+### 4.8 `code_generator.generate_commit_message(changes)`
+**Задача:** Генерация осмысленного commit message
+
+**Логика:**
+1. Промпт: "Based on these code changes, write a concise, conventional commit message (max 72 chars)"
+2. AI генерирует: `type: description` (fix:, feat:, refactor:)
+3. Return message string
+
+---
+
+### 4.9 `output_validator.validate_code(code)`
+**Задача:** Валидация выхода AI
+
+**Логика:**
+1. Проверка: все файлы из `analysis['files_to_modify']` присутствуют
+2. Проверка: код не пустой, синтаксически корректный (basic)
+3. Return `(is_valid: bool, errors: list)`
+
+---
+
+## 5. DOCKER MODULE (Контейнеризация)
+
+### 5.1 `docker_sandbox.ensure_running()`
+**Задача:** Гарантия запущенного Docker Desktop
+
+**Логика:**
+1. Попытка `docker.from_env().ping()`
+2. **IF** успех: return True
+3. **IF** ошибка AND Windows:
+   - Поиск `Docker Desktop.exe` в стандартных путях
+   - `subprocess.Popen([path])` — запуск
+   - Цикл ожидания: 60 попыток с sleep(1)
+   - Повторный `ping()`
+4. **IF** не удалось: raise `DockerError`
+
+---
+
+### 5.2 `docker_sandbox.calculate_resources(code_size, file_count)`
+**Задача:** Расчёт ресурсов по фиксированным ступеням
+
+**Логика:**
+```
+lines = code_size / 50  # примерно 50 символов на строку
+
+IF lines < 1000:
+    cpu = 2
+ELIF lines < 5000:
+    cpu = 4
+ELSE:
+    cpu = 6
+
+ram_mb = 512 + (code_size / 1024) / 10  # 512 + KB/10
+
+Return {'cpu': cpu, 'memory': f'{int(ram_mb)}m'}
+```
+
+---
+
+### 5.3 `docker_sandbox.security_scan(code)`
+**Задача:** Проверка кода на опасные паттерны
+
+**Логика:**
+1. Список запрещённых regex паттернов:
+   - `rm\s+-rf\s+/`
+   - `System\.exit\s*\(`
+   - `Runtime\.exec\s*\(`
+   - `os\.system\s*\(`
+   - `subprocess\.call.*shell=True`
+   - `eval\s*\(`
+   - `exec\s*\(`
+2. Для каждого файла: проверка всех паттернов
+3. Return `list of violations` (пустой если чисто)
+
+---
+
+### 5.4 `docker_sandbox.run_test(code, language, cpu, memory, timeout=25)`
+**Задача:** Запуск теста в изолированном контейнере
+
+**Логика:**
+1. Создание временной директории (`tempfile.TemporaryDirectory`)
+2. Запись файлов в директорию
+3. Выбор образа: `python:3.11-slim` или `openjdk:17-slim`
+4. Формирование команды:
+   - Python: `python {main_file}`
+   - Java: `javac {files} && java Main`
+5. Запуск контейнера:
+   - `docker.containers.run(...)`
+   - `resources=Resources(cpu_count=cpu, mem_limit=memory)`
+   - `network_mode='none'`
+   - `volumes={tmpdir: {'bind': '/code', 'mode': 'ro'}}`
+   - `detach=True`
+6. `container.wait(timeout=25)`
+7. Получение логов: `container.logs()`
+8. Очистка: `container.remove(force=True)`
+9. Return `{'success': exit_code==0, 'output': logs, 'duration': seconds}`
+
+---
+
+### 5.5 `docker_sandbox.cleanup()`
+**Задача:** Очистка остановленных контейнеров
+
+**Логика:**
+1. `docker.containers.list(all=True, filters={'status': 'exited'})`
+2. Для каждого: `container.remove(force=True)`
+3. Логирование количества удалённых
+
+---
+
+## 6. TELEGRAM MODULE (Уведомления и управление)
+
+### 6.1 `telegram_bot.start_bot(orchestrator)`
+**Задача:** Запуск Telegram бота
+
+**Логика:**
+1. Сохранение ссылки на `orchestrator`
+2. Регистрация всех handlers (commands, callbacks)
+3. `aiogram` polling: `dp.start_polling(bot)`
+4. Обработка исключений подключения
+
+---
+
+### 6.2 `telegram_bot.get_main_menu_keyboard()`
+**Задача:** Создание главной клавиатуры
+
+**Логика:**
+1. `InlineKeyboardBuilder()`
+2. Добавление кнопок:
+   - Row 1: [🚀 Статус] [⏸ Пауза] [▶ Старт]
+   - Row 2: [📋 Очередь] [⚙ Настройки]
+   - Row 3: [🚫 Blacklist] [📊 Статистика]
+3. Return `InlineKeyboardMarkup`
+
+---
+
+### 6.3 `telegram_bot.notify_pr_created(issue, pr_url, bounty)`
+**Задача:** Уведомление о созданном PR
+
+**Логика:**
+1. Форматирование сообщения:
+   ```
+   ✅ PR Создан!
+   Issue: #{number}
+   Сумма: ${bounty}
+   {pr_url}
+   ```
+2. `bot.send_message(chat_id, text, parse_mode='HTML')`
+3. Логирование в `telegram_logs`
+
+---
+
+### 6.4 `telegram_bot.notify_pr_merged(pr, issue, translated_text, original_body)`
+**Задача:** Уведомление о merged PR с кнопками действий
+
+**Логика:**
+1. Форматирование:
+   ```
+   🎉 PR #{number} успешно merged!
+   Репозиторий: {repo}
+   Сумма: ${bounty}
+   
+   Перевод письма:
+   {translated_text}
+   ```
+2. Создание кнопок:
+   - `[🔍 Анализировать]` callback: `analyze:{pr_id}`
+   - `[🗑 Удалить]` callback: `delete:{pr_id}`
+   - `[🚀 Статус]` callback: `status`
+   - `[⏸ Пауза]` или `[▶ Старт]` (зависит от `orchestrator.is_paused`)
+   - `[⚙ Настройки]` callback: `settings`
+3. Отправка с `reply_markup`
+
+---
+
+### 6.5 `telegram_bot.cb_analyze_pr(callback)`
+**Задача:** Обработка кнопки "Анализировать"
+
+**Логика:**
+1. Извлечение `pr_id` из callback data
+2. Получение PR из БД
+3. Получение кода PR: `github.get_pr_files()`
+4. Формирование промпта: "Analyze this merged PR. What could be improved? Suggest new criteria."
+5. `ai.generate(prompt)`
+6. Отправка результата пользователю с кнопкой "Сохранить insights"
+7. Сохранение insights в БД (`pr_insights` таблица)
+
+---
+
+### 6.6 `telegram_bot.cb_delete_pr(callback)`
+**Задача:** Обработка кнопки "Удалить"
+
+**Логика:**
+1. Подтверждение: "Уверены?" с кнопками [Да] [Нет]
+2. При подтверждении:
+   - `issue.is_archived = True`
+   - Очистка логов из `telegram_logs` для этого issue
+   - Обновление сообщения: "Запись архивирована"
+
+---
+
+### 6.7 `telegram_bot.notify_rate_limit(service, remaining)`
+**Задача:** Предупреждение о rate limit
+
+**Логика:**
+1. Форматирование: `⚠️ Rate Limit: {service} осталось {remaining}`
+2. Отправка в TG
+3. Сохранение в `rate_limit_logs`
+
+---
+
+### 6.8 `telegram_bot.notify_critical_error(error)`
+**Задача:** Критическое уведомление
+
+**Логика:**
+1. Форматирование: `🚨 КРИТИЧЕСКАЯ ОШИБКА: {error}`
+2. Отправка в TG
+3. Дополнительно: попытка отправки email (если настроено)
+
+---
+
+### 6.9 `telegram_bot.send_daily_digest()`
+**Задача:** Ежедневный отчёт
+
+**Логика:**
+1. Сбор статистики за последние 24 часа:
+   - Новых issue
+   - Завершённых
+   - Заработанных средств
+2. Форматирование красивого сообщения
+3. Отправка в 09:00 (проверка `datetime.utcnow().hour == 9`)
+
+---
+
+## 7. EMAIL MODULE (IMAP интеграция)
+
+### 7.1 `email_monitor.check_loop()`
+**Задача:** Бесконечный цикл проверки почты
+
+**Логика:**
+```
+WHILE True:
+    TRY:
+        check_new_emails()
+    EXCEPT:
+        log_error()
+    
+    sleep(600)  # 10 минут
+```
+
+---
+
+### 7.2 `email_monitor.check_new_emails()`
+**Задача:** Проверка новых писем от GitHub
+
+**Логика:**
+1. Подключение: `imaplib.IMAP4_SSL(host, port)`
+2. `login(email, password)`
+3. `select("inbox")`
+4. Поиск: `search(None, 'UNSEEN FROM "noreply@github.com"')`
+5. Для каждого ID:
+   - `fetch(msg_id, "(RFC822)")`
+   - Парсинг через `email.message_from_bytes()`
+   - `process_email(message)`
+   - `store(msg_id, '+FLAGS', '\\Seen')` — пометить прочитанным
+6. `logout()`
+
+---
+
+### 7.3 `email_monitor.process_email(message)`
+**Задача:** Обработка одного письма
+
+**Логика:**
+1. Декодирование заголовков: `decode_header()`
+2. Проверка: `subject.contains("merged")` AND `from.contains("github.com")`
+3. Извлечение тела: `get_payload(decode=True)`
+4. Если HTML: `BeautifulSoup.get_text()`
+5. Парсинг PR номера: regex `PR\s*#?(\d+)`
+6. Поиск PR в БД: `session.query(PullRequest).filter_by(number=...)`
+7. Обновление: `pr.status = 'merged'`, `pr.merged_at = now()`
+8. Обновление analytics: `actual_earned = estimated_bounty`
+9. Перевод на русский: `translate_to_russian(body)`
+10. Вызов `telegram.notify_pr_merged()`
+
+---
+
+### 7.4 `email_monitor.translate_to_russian(text)`
+**Задача:** Перевод текста письма
+
+**Логика:**
+1. Промпт: "Переведи с английского на русский, сохрани технические термины"
+2. `ai.generate(prompt, max_tokens=1000)`
+3. Return переведённый текст (обрезанный до 2000 символов если нужно)
+
+---
+
+## 8. DATABASE MODULE (Работа с SQLite)
+
+### 8.1 `repository.create_issue(data)`
+**Задача:** Создание записи issue
+
+**Логика:**
+1. Создание объекта `Issue(**data)`
+2. `session.add(issue)`
+3. `session.commit()`
+4. Return `issue.id`
+
+---
+
+### 8.2 `repository.get_pending_issues()`
+**Задача:** Получение ожидающих issue
+
+**Логика:**
+1. `query(Issue).filter_by(status='pending').order_by(Issue.priority.desc())`
+2. Return list
+
+---
+
+### 8.3 `repository.update_issue_status(issue_id, status)`
+**Задача:** Обновление статуса
+
+**Логика:**
+1. `issue = query(Issue).get(issue_id)`
+2. `issue.status = status`
+3. `issue.updated_at = now()`
+4. `session.commit()`
+
+---
+
+### 8.4 `repository.create_attempt(issue_id, data)`
+**Задача:** Логирование попытки
+
+**Логика:**
+1. Создание `Attempt(issue_id=issue_id, **data)`
+2. `session.add(attempt)`
+3. `session.commit()`
+
+---
+
+### 8.5 `analytics.calculate_success_rate()`
+**Задача:** Расчёт успешности
+
+**Логика:**
+1. `total = count(Issue)`
+2. `completed = count(status='completed')`
+3. `failed = count(status='failed')`
+4. Return `completed / total * 100`
+
+---
+
+### 8.6 `analytics.calculate_total_earnings()`
+**Задача:** Подсчёт заработанных средств
+
+**Логика:**
+1. `query(Analytics).filter(Analytics.actual_earned > 0)`
+2. `sum(a.actual_earned for a in results)`
+3. Return сумма
+
+---
+
+## 9. UTILS (Вспомогательные функции)
+
+### 9.1 `logger.setup_logging(level, format)`
+**Задача:** Настройка логирования
+
+**Логика:**
+1. Если `format == 'JSON'`:
+   - Использовать `python-json-logger`
+   - Структура: `{"timestamp": "...", "level": "...", "message": "..."}`
+2. Иначе: стандартный текстовый формат
+3. Настройка `logging.getLogger()` с handlers (file + console)
+
+---
+
+### 9.2 `retry.with_retry(max_attempts, delay)`
+**Задача:** Декоратор для retry логики
+
+**Логика:**
+1. Обёртывание функции
+2. Цикл `for attempt in range(max_attempts)`:
+   - TRY: выполнить функцию
+   - EXCEPT: sleep(delay), continue
+3. После исчерпания попыток — raise последнее исключение
+
+---
+
+### 9.3 `validators.is_valid_github_url(url)`
+**Задача:** Валидация URL GitHub
+
+**Логика:**
+1. Regex: `^https://github\.com/[\w-]+/[\w-]+`
+2. Return match is not None
+## 10. MAIN (Точка входа)
+
+### 10.1 `main()`
+**Задача:** Запуск приложения
+
+**Логика:**
+1. `lifespan()` context manager:
+   - Startup: `setup_logging()`, `init_db()`, лог приветствия
+   - Shutdown: лог завершения, cleanup
+2. Создание `Orchestrator()`
+3. `orchestrator.start()`
+4. Обработка `KeyboardInterrupt` (Ctrl+C)
+5. Обработка критических исключений
